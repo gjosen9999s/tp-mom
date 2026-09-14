@@ -1,6 +1,4 @@
 import pika
-import random
-import string
 from .middleware import (
                         MessageMiddlewareCloseError,
                         MessageMiddlewareDisconnectedError,
@@ -160,27 +158,50 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     
     def __init__(self, host, exchange_name, routing_keys):
 
+        connection = None
+        channel = None 
+
+        self._is_consuming = False
+        self.queue_name = None
+
         try:
 
             self.routing_keys = routing_keys
 
             #conexion al host
-            self.connection = pika.BlockingConnection(
+            connection = pika.BlockingConnection(
             pika.ConnectionParameters(host=host))
 
             #canal
-            self.channel = self.connection.channel()
+            channel = connection.channel()
 
             #exchange
             self.exchange_name = exchange_name
 
-            self.channel.exchange_declare(exchange=self.exchange_name, exchange_type='direct')
+            channel.exchange_declare(exchange=self.exchange_name, exchange_type='direct')
                 
         except pika.exceptions.AMQPConnectionError as e:
+
+            if channel is not None and channel.is_open:
+                channel.close()
+            
+            if connection is not None and connection.is_open:
+                connection.close()
+
             raise MessageMiddlewareDisconnectedError() from e 
 
         except pika.exceptions.AMQPError as e:
+
+            if channel is not None and channel.is_open:
+                channel.close()
+            
+            if connection is not None and connection.is_open:
+                connection.close()
+
             raise MessageMiddlewareMessageError() from e 
+
+        self.channel = channel
+        self.connection = connection
 
     # Wrapper para invocar el start_consuming dado que la funcion de callback no tiene los parametros 
     # requeridos por pika
@@ -208,6 +229,11 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     #Si ocurre un error interno que no puede resolverse eleva MessageMiddlewareMessageError.
     def start_consuming(self, on_message_callback):
 
+        if self._is_consuming:
+            raise MessageMiddlewareMessageError()
+
+        self._is_consuming = True
+
         try:
 
             #cola a asociar
@@ -225,11 +251,27 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             self.channel.start_consuming()
 
         except pika.exceptions.AMQPConnectionError as e:
+
+            try:
+                if self.queue_name:
+                    self.channel.queue_delete(queue=self.queue_name)
+            except Exception:
+                pass
+
             raise MessageMiddlewareDisconnectedError() from e 
             
         except pika.exceptions.AMQPError as e:
+
+            try:
+                if self.queue_name:
+                    self.channel.queue_delete(queue=self.queue_name)
+            except Exception:
+                pass
+
             raise MessageMiddlewareMessageError() from e 
-            # resta ver si hay un caso genuino de error que no es error a considerar
+
+        finally:
+            self._is_consuming = False
         
     #Si se estaba consumiendo desde la cola/exchange, se detiene la escucha. Si
     #no se estaba consumiendo de la cola/exchange, no tiene efecto, ni levanta
@@ -237,11 +279,13 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     def stop_consuming(self):
 
         try:
-
             self.channel.stop_consuming()
-
+        
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError() from e 
+
+        finally:
+            self._is_consuming = False
         
     #Envía un mensaje a la cola o al tópico con el que se inicializó el exchange.
     #Si se pierde la conexión con el middleware eleva MessageMiddlewareDisconnectedError.
@@ -268,11 +312,16 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     #Si ocurre un error interno que no puede resolverse eleva MessageMiddlewareCloseError.
     def close(self):
 
+        #orden inverso al del init, no se borra la cola porque se comparte
         try:
-            #orden inverso al del init, no se borra la cola porque se comparte
-            self.channel.close()
+            try:
+                if self.channel is not None and self.channel.is_open:
+                    self.channel.close()
 
-            self.connection.close()
+            finally:
+
+                if self.connection is not None and self.connection.is_open:
+                    self.connection.close()
 
         except Exception as e:
             raise MessageMiddlewareCloseError() from e
