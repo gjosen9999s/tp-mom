@@ -13,29 +13,50 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
     def __init__(self, host, queue_name):
 
+        connection = None
+        channel = None 
+
+        self._is_consuming = False
+
         try:
             #conexion al host
-            self.connection = pika.BlockingConnection(
+            connection = pika.BlockingConnection(
             pika.ConnectionParameters(host=host))
 
             #canal
-            self.channel = self.connection.channel()
+            channel = connection.channel()
 
             #cola
             self.queue_name = queue_name 
-            self.channel.queue_declare(queue=queue_name,
-                                       durable=True, arguments={'x-queue-type': 'quorum'})
+            channel.queue_declare(queue=queue_name, durable=True)
             
         except pika.exceptions.AMQPConnectionError as e:
+
+            if channel is not None and channel.is_open:
+                channel.close()
+
+            if connection is not None and connection.is_open:
+                connection.close()
+
             raise MessageMiddlewareDisconnectedError() from e 
         
         except pika.exceptions.AMQPError as e:
+
+            if channel is not None and channel.is_open:
+                channel.close()
+            
+            if connection is not None and connection.is_open:
+                connection.close()
+
             raise MessageMiddlewareMessageError() from e 
+
+        self.channel = channel
+        self.connection = connection
 
 
     # Wrapper para invocar el start_consuming dado que la funcion de callback no tiene los parametros 
     # requeridos por pika
-    def wrap_callback(self, on_message_callback):
+    def _wrap_callback(self, on_message_callback):
 
         def callback(ch, method, properties, body):
 
@@ -59,10 +80,15 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
     #Si ocurre un error interno que no puede resolverse eleva MessageMiddlewareMessageError.
     def start_consuming(self, on_message_callback):
 
+        if self._is_consuming:
+            raise MessageMiddlewareMessageError()
+
+        self._is_consuming = True
+
         try:
 
             self.channel.basic_consume(queue=self.queue_name, 
-                                        on_message_callback=self.wrap_callback(on_message_callback))
+                                        on_message_callback=self._wrap_callback(on_message_callback))
 
             self.channel.start_consuming()
 
@@ -71,8 +97,11 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             
         except pika.exceptions.AMQPError as e:
             raise MessageMiddlewareMessageError() from e 
-            # resta ver si hay un caso genuino de error que no es error a considerar
-     
+            
+        finally:
+            self._is_consuming = False
+        
+
     #Si se estaba consumiendo desde la cola/exchange, se detiene la escucha. Si
     #no se estaba consumiendo de la cola/exchange, no tiene efecto, ni levanta
     #Si se pierde la conexión con el middleware eleva MessageMiddlewareDisconnectedError.
@@ -84,6 +113,9 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError() from e 
+
+        finally:
+            self._is_consuming = False
 
 	#Envía un mensaje a la cola o al tópico con el que se inicializó el exchange.
 	#Si se pierde la conexión con el middleware eleva MessageMiddlewareDisconnectedError.
@@ -110,15 +142,19 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 	#Si ocurre un error interno que no puede resolverse eleva MessageMiddlewareCloseError.
     def close(self):
 
+        #orden inverso al del init, no se borra la cola porque se comparte
         try:
-            #orden inverso al del init, no se borra la cola porque se comparte
-            self.channel.close()
+            try:
+                if self.channel is not None and self.channel.is_open:
+                    self.channel.close()
 
-            self.connection.close()
+            finally:
+
+                if self.connection is not None and self.connection.is_open:
+                    self.connection.close()
 
         except Exception as e:
             raise MessageMiddlewareCloseError() from e
-
     
 class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     
@@ -139,15 +175,6 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             self.exchange_name = exchange_name
 
             self.channel.exchange_declare(exchange=self.exchange_name, exchange_type='direct')
-
-            #cola a asociar
-            result = self.channel.queue_declare(queue='', exclusive=True)
-            self.queue_name = result.method.queue
-
-            #bind
-            for routing_key in self.routing_keys:
-                self.channel.queue_bind(exchange=self.exchange_name, 
-                                        queue=self.queue_name, routing_key=routing_key)
                 
         except pika.exceptions.AMQPConnectionError as e:
             raise MessageMiddlewareDisconnectedError() from e 
@@ -157,7 +184,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
     # Wrapper para invocar el start_consuming dado que la funcion de callback no tiene los parametros 
     # requeridos por pika
-    def wrap_callback(self, on_message_callback):
+    def _wrap_callback(self, on_message_callback):
 
         def callback(ch, method, properties, body):
 
@@ -183,8 +210,17 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
 
         try:
 
+            #cola a asociar
+            result = self.channel.queue_declare(queue='', exclusive=True)
+            self.queue_name = result.method.queue
+
+            #bind
+            for routing_key in self.routing_keys:
+                self.channel.queue_bind(exchange=self.exchange_name, 
+                                        queue=self.queue_name, routing_key=routing_key)
+                
             self.channel.basic_consume(queue=self.queue_name, 
-                                        on_message_callback=self.wrap_callback(on_message_callback))
+                                        on_message_callback=self._wrap_callback(on_message_callback))
 
             self.channel.start_consuming()
 
@@ -199,7 +235,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
     #no se estaba consumiendo de la cola/exchange, no tiene efecto, ni levanta
     #Si se pierde la conexión con el middleware eleva MessageMiddlewareDisconnectedError.
     def stop_consuming(self):
-        
+
         try:
 
             self.channel.stop_consuming()
